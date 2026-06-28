@@ -1,0 +1,23 @@
+# Variáveis de ambiente — NUNCA commitar
+.env
+*.env.local
+
+# Uploads (planilhas com dados de clientes)
+backend/uploads/
+
+# Python
+backend/__pycache__/
+backend/*.pyc
+backend/*.pyo
+*.py[cod]
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# IDE e sistema
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
