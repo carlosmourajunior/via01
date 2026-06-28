@@ -8,19 +8,35 @@ import hashlib
 import unicodedata
 from os import environ
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher, get_close_matches
 
 import requests
 import pandas as pd
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── Auth ────────────────────────────────────────────────────────────────────
+SECRET_KEY = environ.get("SECRET_KEY", "via01-dev-secret-change-in-production")
+ALGORITHM  = "HS256"
+TOKEN_EXPIRE_HOURS = 8
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+# ── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Controle Interno API")
 
 app.add_middleware(
@@ -29,6 +45,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Rotas públicas — sem autenticação
+_PUBLIC = {"/api/auth/login", "/api/health"}
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if request.url.path in _PUBLIC or request.method == "OPTIONS":
+        return await call_next(request)
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return JSONResponse({"detail": "Não autenticado"}, status_code=401)
+    try:
+        jwt.decode(auth[7:], SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        return JSONResponse({"detail": "Token inválido ou expirado"}, status_code=401)
+    return await call_next(request)
 
 UPLOAD_DIR = Path("/app/uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -437,14 +469,41 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ixc_contratos_data   ON ixc_contratos (data_ativacao)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ixc_contratos_cidade ON ixc_contratos (cidade_ixc_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ixc_contratos_cli    ON ixc_contratos (id_cliente)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id       SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                nome     TEXT,
+                senha    TEXT NOT NULL,
+                ativo    BOOLEAN DEFAULT TRUE
+            )
+        """)
     conn.commit()
     conn.close()
+
+
+def _criar_admin_padrao():
+    """Cria usuário admin se nenhum usuário existir no banco."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM usuarios")
+            if cur.fetchone()[0] == 0:
+                senha_hash = pwd_context.hash("admin123")
+                cur.execute(
+                    "INSERT INTO usuarios (username, nome, senha) VALUES (%s, %s, %s)",
+                    ("admin", "Administrador", senha_hash),
+                )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @app.on_event("startup")
 def startup():
     if DATABASE_URL:
         init_db()
+        _criar_admin_padrao()
 
 
 def _row_hash(row: dict, colunas: list) -> str:
@@ -690,6 +749,71 @@ def _canc_to_rows(df: pd.DataFrame) -> list:
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+# ── Auth endpoints ────────────────────────────────────────────────────────────
+
+@app.post("/api/auth/login")
+def auth_login(body: LoginRequest):
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, username, nome, senha, ativo FROM usuarios WHERE username = %s",
+                (body.username.strip(),),
+            )
+            user = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not user or not user["ativo"]:
+        raise HTTPException(status_code=401, detail="Usuário ou senha inválidos")
+    if not pwd_context.verify(body.password, user["senha"]):
+        raise HTTPException(status_code=401, detail="Usuário ou senha inválidos")
+
+    expires = datetime.utcnow() + timedelta(hours=TOKEN_EXPIRE_HOURS)
+    token = jwt.encode(
+        {"sub": user["username"], "nome": user["nome"], "exp": expires},
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+    return {"access_token": token, "token_type": "bearer", "nome": user["nome"], "username": user["username"]}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    token = request.headers.get("Authorization", "")[7:]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return {"username": payload.get("sub"), "nome": payload.get("nome")}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+
+@app.post("/api/auth/alterar-senha")
+def auth_alterar_senha(request: Request, body: dict):
+    token = request.headers.get("Authorization", "")[7:]
+    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    username = payload.get("sub")
+    senha_atual = body.get("senha_atual", "")
+    nova_senha  = body.get("nova_senha", "")
+    if not nova_senha or len(nova_senha) < 4:
+        raise HTTPException(status_code=400, detail="Nova senha deve ter ao menos 4 caracteres")
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT senha FROM usuarios WHERE username = %s", (username,))
+            user = cur.fetchone()
+            if not user or not pwd_context.verify(senha_atual, user["senha"]):
+                raise HTTPException(status_code=401, detail="Senha atual incorreta")
+            cur.execute(
+                "UPDATE usuarios SET senha = %s WHERE username = %s",
+                (pwd_context.hash(nova_senha), username),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"message": "Senha alterada com sucesso"}
 
 
 @app.get("/api/admin/arquivo")
