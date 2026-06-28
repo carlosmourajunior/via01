@@ -114,7 +114,10 @@ export default function VendasIXC() {
     setErroGlobal(null)
     try {
       await axios.post('/api/ixc/sync-clientes')
-      await axios.post('/api/ixc/sync-contratos')
+      await Promise.all([
+        axios.post('/api/ixc/sync-contratos'),
+        axios.post('/api/ixc/sync-logins'),
+      ])
       await Promise.all([
         axios.post(`/api/ixc/sync-os?ano=${ANO_ATUAL}`),
         axios.post(`/api/ixc/sync-os?ano=${ANO_ATUAL - 1}`),

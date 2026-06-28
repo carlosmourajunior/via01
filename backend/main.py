@@ -296,6 +296,49 @@ def _ixc_fetch_os(data_inicio: str, data_fim: str) -> list:
     return todos
 
 
+def _ixc_fetch_logins(data_inicio: str) -> list:
+    """Busca logins do IXC (cliente_login) com data_criacao >= data_inicio."""
+    todos: list = []
+    page = 1
+    while True:
+        payload = {
+            "qtype":     "data_criacao",
+            "query":     data_inicio,
+            "oper":      ">=",
+            "page":      page,
+            "rp":        200,
+            "sortname":  "data_criacao",
+            "sortorder": "asc",
+        }
+        try:
+            resp = requests.post(
+                f"{IXC_BASE}/cliente_login",
+                data=json.dumps(payload),
+                headers=_ixc_headers(),
+                timeout=60,
+                verify=True,
+            )
+            data = resp.json()
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Erro ao consultar logins IXC: {e}")
+
+        if data.get("type") == "error":
+            raise HTTPException(status_code=502, detail=f"IXC logins: {data.get('message', 'erro desconhecido')}")
+
+        regs = data.get("registros", [])
+        if not regs:
+            break
+
+        todos.extend(regs)
+        total_api = int(data.get("total", 0))
+        total_pages = (total_api + 199) // 200
+        if page >= total_pages:
+            break
+        page += 1
+
+    return todos
+
+
 def _ixc_fetch_contratos(data_inicio: str) -> list:
     """Busca contratos do IXC (cliente_contrato) com data_ativacao >= data_inicio."""
     todos: list = []
@@ -469,6 +512,22 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ixc_contratos_data   ON ixc_contratos (data_ativacao)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ixc_contratos_cidade ON ixc_contratos (cidade_ixc_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ixc_contratos_cli    ON ixc_contratos (id_cliente)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ixc_logins (
+                id            SERIAL PRIMARY KEY,
+                ixc_login_id  INTEGER UNIQUE NOT NULL,
+                id_cliente    INTEGER,
+                id_contrato   INTEGER,
+                login         TEXT,
+                data_criacao  DATE,
+                ativo         CHAR(1),
+                cidade_ixc_id TEXT,
+                synced_at     TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ixc_logins_data    ON ixc_logins (data_criacao)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ixc_logins_cidade  ON ixc_logins (cidade_ixc_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ixc_logins_cliente ON ixc_logins (id_cliente)")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS usuarios (
                 id       SERIAL PRIMARY KEY,
@@ -2334,6 +2393,105 @@ def ixc_debug_contratos(pagina: int = 1, rp: int = 3):
     }
 
 
+@app.post("/api/ixc/sync-logins")
+def ixc_sync_logins(meses: int = 14):
+    """Sincroniza cliente_login do IXC usando data_criacao. Requer sync-clientes executado antes."""
+    if not IXC_TOKEN:
+        raise HTTPException(status_code=503, detail="IXC_TOKEN não configurado.")
+
+    from datetime import timedelta
+    data_inicio = (datetime.now() - timedelta(days=30 * meses)).strftime("%Y-%m-%d")
+
+    logins = _ixc_fetch_logins(data_inicio)
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ixc_id, cidade_ixc_id FROM ixc_clientes")
+            cidade_map = {r[0]: r[1] for r in cur.fetchall()}
+
+            inseridos = atualizados = 0
+            for lg in logins:
+                dc_raw = (lg.get("data_criacao") or "")[:10]
+                if not dc_raw or dc_raw.startswith("0000"):
+                    continue
+                try:
+                    ixc_login_id = int(lg.get("id", 0))
+                    id_cliente   = int(lg.get("id_cliente") or 0) or None
+                    id_contrato  = int(lg.get("id_contrato") or 0) or None
+                except (ValueError, TypeError):
+                    continue
+                cidade_id = cidade_map.get(id_cliente)
+                cur.execute("""
+                    INSERT INTO ixc_logins
+                        (ixc_login_id, id_cliente, id_contrato, login, data_criacao, ativo, cidade_ixc_id, synced_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ixc_login_id) DO UPDATE SET
+                        id_cliente    = EXCLUDED.id_cliente,
+                        id_contrato   = EXCLUDED.id_contrato,
+                        login         = EXCLUDED.login,
+                        data_criacao  = EXCLUDED.data_criacao,
+                        ativo         = EXCLUDED.ativo,
+                        cidade_ixc_id = EXCLUDED.cidade_ixc_id,
+                        synced_at     = NOW()
+                """, (
+                    ixc_login_id, id_cliente, id_contrato,
+                    lg.get("login", ""),
+                    dc_raw,
+                    (lg.get("ativo") or "S")[:1],
+                    cidade_id,
+                ))
+                if cur.rowcount == 1:
+                    inseridos += 1
+                else:
+                    atualizados += 1
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "message":    f"Sincronizados {len(logins)} logins do IXC.",
+        "total":      len(logins),
+        "inseridos":  inseridos,
+        "atualizados": atualizados,
+        "synced_at":  datetime.now().isoformat(),
+    }
+
+
+@app.get("/api/ixc/debug-logins")
+def ixc_debug_logins(pagina: int = 1, rp: int = 3):
+    """Retorna campos crus de cliente_login — útil para inspecionar a estrutura da API IXC."""
+    if not IXC_TOKEN:
+        raise HTTPException(status_code=503, detail="IXC_TOKEN não configurado.")
+    payload = {
+        "qtype": "id", "query": "1", "oper": ">=",
+        "page": pagina, "rp": rp,
+        "sortname": "id", "sortorder": "desc",
+    }
+    try:
+        resp = requests.post(
+            f"{IXC_BASE}/cliente_login",
+            data=json.dumps(payload),
+            headers=_ixc_headers(),
+            timeout=30,
+            verify=True,
+        )
+        data = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    registros = data.get("registros", [])
+    todos_campos = set()
+    for r in registros:
+        todos_campos.update(r.keys())
+
+    return {
+        "total_api":          data.get("total", 0),
+        "campos_disponiveis": sorted(todos_campos),
+        "amostra":            registros,
+    }
+
+
 @app.get("/api/ixc/cancelamentos-ixc")
 def ixc_cancelamentos_ixc(origem: str = "borda_mata"):
     """Retorna OS de cancelamento do IXC por cidade, usando data_abertura como referência."""
@@ -2397,7 +2555,10 @@ def ixc_cancelamentos_ixc(origem: str = "borda_mata"):
 
 @app.get("/api/ixc/vendas")
 def ixc_vendas(origem: str = "borda_mata"):
-    """Retorna contratos IXC por cidade usando data_ativacao."""
+    """Retorna conexões IXC por cidade.
+    Fonte primária: ixc_logins (um login = um ponto, inclusive segundo ponto).
+    Fallback: ixc_contratos para clientes sem logins sincronizados.
+    """
     if origem not in IXC_CIDADES:
         raise HTTPException(status_code=400, detail=f"Origem desconhecida: {origem}")
 
@@ -2408,27 +2569,55 @@ def ixc_vendas(origem: str = "borda_mata"):
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
                 SELECT
-                    ct.ixc_contrato_id,
+                    lg.ixc_login_id  AS source_id,
+                    'login'          AS tipo,
+                    lg.id_cliente,
+                    lg.login         AS login_nome,
+                    lg.data_criacao  AS data_ativacao,
+                    NULL             AS status,
+                    cl.nome,
+                    cl.bairro,
+                    cl.fone
+                FROM ixc_logins lg
+                INNER JOIN ixc_clientes cl ON cl.ixc_id = lg.id_cliente
+                WHERE lg.cidade_ixc_id = %s AND cl.ativo = 'S'
+
+                UNION ALL
+
+                SELECT
+                    ct.ixc_contrato_id AS source_id,
+                    'contrato'         AS tipo,
                     ct.id_cliente,
+                    NULL               AS login_nome,
                     ct.data_ativacao,
                     ct.status,
                     cl.nome,
                     cl.bairro,
-                    cl.fone,
-                    cl.ativo AS cliente_ativo
+                    cl.fone
                 FROM ixc_contratos ct
                 INNER JOIN ixc_clientes cl ON cl.ixc_id = ct.id_cliente
-                WHERE ct.cidade_ixc_id = %s
-                  AND cl.ativo = 'S'
-                ORDER BY ct.data_ativacao DESC
-            """, (cidade_id,))
+                WHERE ct.cidade_ixc_id = %s AND cl.ativo = 'S'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM ixc_logins lg2
+                      WHERE lg2.id_cliente = ct.id_cliente
+                  )
+
+                ORDER BY data_ativacao DESC
+            """, (cidade_id, cidade_id))
             rows = [dict(r) for r in cur.fetchall()]
+
+            # last_sync = mais recente entre as duas tabelas
+            cur.execute(
+                "SELECT MAX(synced_at) AS ts FROM ixc_logins WHERE cidade_ixc_id = %s",
+                (cidade_id,)
+            )
+            ts_logins = (cur.fetchone() or {}).get("ts")
             cur.execute(
                 "SELECT MAX(synced_at) AS ts FROM ixc_contratos WHERE cidade_ixc_id = %s",
                 (cidade_id,)
             )
-            last_sync_row = cur.fetchone()
-            last_sync = last_sync_row["ts"] if last_sync_row else None
+            ts_contratos = (cur.fetchone() or {}).get("ts")
+            last_sync = max(filter(None, [ts_logins, ts_contratos]), default=None)
     finally:
         conn.close()
 
