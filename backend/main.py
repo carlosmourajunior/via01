@@ -2460,36 +2460,42 @@ def ixc_sync_logins(meses: int = 14):
 
 @app.get("/api/ixc/debug-logins")
 def ixc_debug_logins(pagina: int = 1, rp: int = 3):
-    """Retorna campos crus de cliente_login — útil para inspecionar a estrutura da API IXC."""
+    """Testa candidatos de endpoint para logins IXC e retorna campos/erros de cada um."""
     if not IXC_TOKEN:
         raise HTTPException(status_code=503, detail="IXC_TOKEN não configurado.")
+
     payload = {
         "qtype": "id", "query": "1", "oper": ">=",
         "page": pagina, "rp": rp,
         "sortname": "id", "sortorder": "desc",
     }
-    try:
-        resp = requests.post(
-            f"{IXC_BASE}/cliente_login",
-            data=json.dumps(payload),
-            headers=_ixc_headers(),
-            timeout=30,
-            verify=True,
-        )
-        data = resp.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+    candidatos = ["cliente_login", "cliente_acesso", "acessos", "login"]
+    resultados = {}
 
-    registros = data.get("registros", [])
-    todos_campos = set()
-    for r in registros:
-        todos_campos.update(r.keys())
+    for ep in candidatos:
+        try:
+            resp = requests.post(
+                f"{IXC_BASE}/{ep}",
+                data=json.dumps(payload),
+                headers=_ixc_headers(),
+                timeout=15,
+                verify=True,
+            )
+            data = resp.json()
+            registros = data.get("registros", [])
+            campos = sorted(set(k for r in registros for k in r.keys()))
+            resultados[ep] = {
+                "http_status": resp.status_code,
+                "ixc_type":    data.get("type", "ok"),
+                "ixc_message": data.get("message", ""),
+                "total":       data.get("total", 0),
+                "campos":      campos,
+                "amostra":     registros[:2],
+            }
+        except Exception as e:
+            resultados[ep] = {"erro": str(e)}
 
-    return {
-        "total_api":          data.get("total", 0),
-        "campos_disponiveis": sorted(todos_campos),
-        "amostra":            registros,
-    }
+    return resultados
 
 
 @app.get("/api/ixc/cancelamentos-ixc")
