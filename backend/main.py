@@ -2521,15 +2521,14 @@ def ixc_debug_cancelamentos(origem: str = "borda_mata"):
 
 @app.get("/api/ixc/cancelamentos-ixc")
 def ixc_cancelamentos_ixc(origem: str = "borda_mata"):
-    """Retorna OS de cancelamento fechadas do IXC por cidade.
-    Conta apenas OS fechadas (status=F) excluindo 'Cancelar Contrato Sistema'
-    e 'Cancelamento - Retirada de equipamento'.
+    """Retorna cancelamentos IXC por cidade.
+    Conta OS de assunto 'Reversão do Cancelamento' (id=26) com status F (fechada).
     """
     if origem not in IXC_CIDADES:
         raise HTTPException(status_code=400, detail=f"Origem desconhecida: {origem}")
 
     cidade_id = IXC_CIDADES[origem]
-    ids_canc  = [int(x) for x in IXC_GRUPOS_ASSUNTO["Cancelamento"]]
+    ID_REVERSAO_CANCELAMENTO = 26
 
     conn = get_conn()
     try:
@@ -2548,12 +2547,10 @@ def ixc_cancelamentos_ixc(origem: str = "borda_mata"):
                 FROM ixc_os o
                 LEFT JOIN ixc_clientes cl ON cl.ixc_id = o.id_cliente
                 WHERE o.id_cidade = %s
-                  AND o.id_assunto = ANY(%s)
+                  AND o.id_assunto = %s
                   AND o.status = 'F'
-                  AND LOWER(o.assunto) NOT LIKE '%%cancelar contrato sistema%%'
-                  AND LOWER(o.assunto) NOT LIKE '%%retirada de equipamento%%'
                 ORDER BY o.data_abertura DESC
-            """, (cidade_id, ids_canc))
+            """, (cidade_id, ID_REVERSAO_CANCELAMENTO))
             rows = [dict(r) for r in cur.fetchall()]
 
             por_assunto: dict = {}
@@ -2566,8 +2563,8 @@ def ixc_cancelamentos_ixc(origem: str = "borda_mata"):
             )
 
             cur.execute(
-                "SELECT MAX(synced_at) AS ts FROM ixc_os WHERE id_cidade = %s AND id_assunto = ANY(%s)",
-                (cidade_id, ids_canc)
+                "SELECT MAX(synced_at) AS ts FROM ixc_os WHERE id_cidade = %s AND id_assunto = %s",
+                (cidade_id, ID_REVERSAO_CANCELAMENTO)
             )
             last_sync_row = cur.fetchone()
             last_sync = last_sync_row["ts"] if last_sync_row else None
