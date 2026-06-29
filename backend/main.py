@@ -2583,6 +2583,7 @@ def ixc_vendas(origem: str = "borda_mata"):
                 FROM ixc_contratos ct
                 LEFT JOIN ixc_clientes cl ON cl.ixc_id = ct.id_cliente
                 WHERE ct.cidade_ixc_id = %s
+                  AND cl.ativo = 'S'
                 ORDER BY ct.data_ativacao DESC
             """, (cidade_id,))
             rows = [dict(r) for r in cur.fetchall()]
