@@ -2433,10 +2433,10 @@ def ixc_sync_logins(meses: int = 14):
                         id_cliente    = EXCLUDED.id_cliente,
                         id_contrato   = EXCLUDED.id_contrato,
                         login         = EXCLUDED.login,
-                        data_criacao  = EXCLUDED.data_criacao,
                         ativo         = EXCLUDED.ativo,
                         cidade_ixc_id = EXCLUDED.cidade_ixc_id,
                         synced_at     = NOW()
+                    -- data_criacao NÃO é atualizada: preserva a data da primeira inserção (criação real)
                 """, (
                     ixc_login_id, id_cliente, id_contrato,
                     lg.get("login", ""),
