@@ -2578,7 +2578,8 @@ def ixc_vendas(origem: str = "borda_mata"):
                     ct.status,
                     cl.nome,
                     cl.bairro,
-                    cl.fone
+                    cl.fone,
+                    cl.ativo           AS cliente_ativo
                 FROM ixc_contratos ct
                 LEFT JOIN ixc_clientes cl ON cl.ixc_id = ct.id_cliente
                 WHERE ct.cidade_ixc_id = %s
