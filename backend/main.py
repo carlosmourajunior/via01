@@ -2497,15 +2497,39 @@ def ixc_debug_logins(pagina: int = 1, rp: int = 3):
     }
 
 
+@app.get("/api/ixc/debug-cancelamentos")
+def ixc_debug_cancelamentos(origem: str = "borda_mata"):
+    """Lista assuntos e status distintos das OS de cancelamento — para calibrar filtros."""
+    if origem not in IXC_CIDADES:
+        raise HTTPException(status_code=400, detail=f"Origem desconhecida: {origem}")
+    cidade_id = IXC_CIDADES[origem]
+    ids_canc  = [int(x) for x in IXC_GRUPOS_ASSUNTO["Cancelamento"]]
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT o.assunto, o.status, COUNT(*) AS total
+                FROM ixc_os o
+                WHERE o.id_cidade = %s AND o.id_assunto = ANY(%s)
+                GROUP BY o.assunto, o.status
+                ORDER BY o.assunto, o.status
+            """, (cidade_id, ids_canc))
+            return {"por_assunto_status": [dict(r) for r in cur.fetchall()]}
+    finally:
+        conn.close()
+
+
 @app.get("/api/ixc/cancelamentos-ixc")
 def ixc_cancelamentos_ixc(origem: str = "borda_mata"):
-    """Retorna OS de cancelamento do IXC por cidade, usando data_abertura como referência."""
+    """Retorna OS de cancelamento fechadas do IXC por cidade.
+    Conta apenas OS fechadas (status=F) excluindo 'Cancelar Contrato Sistema'
+    e 'Cancelamento - Retirada de equipamento'.
+    """
     if origem not in IXC_CIDADES:
         raise HTTPException(status_code=400, detail=f"Origem desconhecida: {origem}")
 
     cidade_id = IXC_CIDADES[origem]
-    # Exclui assunto 6 ("Cancelamento - Retirada de equipamento") — não conta como cancelamento
-    ids_canc  = [int(x) for x in IXC_GRUPOS_ASSUNTO["Cancelamento"] if x != "6"]
+    ids_canc  = [int(x) for x in IXC_GRUPOS_ASSUNTO["Cancelamento"]]
 
     conn = get_conn()
     try:
@@ -2525,11 +2549,13 @@ def ixc_cancelamentos_ixc(origem: str = "borda_mata"):
                 LEFT JOIN ixc_clientes cl ON cl.ixc_id = o.id_cliente
                 WHERE o.id_cidade = %s
                   AND o.id_assunto = ANY(%s)
+                  AND o.status = 'F'
+                  AND LOWER(o.assunto) NOT LIKE '%%cancelar contrato sistema%%'
+                  AND LOWER(o.assunto) NOT LIKE '%%retirada de equipamento%%'
                 ORDER BY o.data_abertura DESC
             """, (cidade_id, ids_canc))
             rows = [dict(r) for r in cur.fetchall()]
 
-            # Contagem por assunto para breakdown
             por_assunto: dict = {}
             for r in rows:
                 a = r.get("assunto") or "Sem assunto"
