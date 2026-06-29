@@ -297,22 +297,24 @@ def _ixc_fetch_os(data_inicio: str, data_fim: str) -> list:
 
 
 def _ixc_fetch_logins(data_inicio: str) -> list:
-    """Busca logins do IXC (cliente_login) com data_criacao >= data_inicio."""
+    """Busca radusuarios do IXC com ultima_atualizacao >= data_inicio.
+    radusuarios: um registro por conexão PPPoE (login); ultima_atualizacao = CURRENT_TIMESTAMP na criação.
+    """
     todos: list = []
     page = 1
     while True:
         payload = {
-            "qtype":     "data_criacao",
+            "qtype":     "radusuarios.ultima_atualizacao",
             "query":     data_inicio,
             "oper":      ">=",
             "page":      page,
             "rp":        200,
-            "sortname":  "data_criacao",
+            "sortname":  "radusuarios.ultima_atualizacao",
             "sortorder": "asc",
         }
         try:
             resp = requests.post(
-                f"{IXC_BASE}/cliente_login",
+                f"{IXC_BASE}/radusuarios",
                 data=json.dumps(payload),
                 headers=_ixc_headers(),
                 timeout=60,
@@ -320,10 +322,10 @@ def _ixc_fetch_logins(data_inicio: str) -> list:
             )
             data = resp.json()
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Erro ao consultar logins IXC: {e}")
+            raise HTTPException(status_code=502, detail=f"Erro ao consultar radusuarios IXC: {e}")
 
         if data.get("type") == "error":
-            raise HTTPException(status_code=502, detail=f"IXC logins: {data.get('message', 'erro desconhecido')}")
+            raise HTTPException(status_code=502, detail=f"IXC radusuarios: {data.get('message', 'erro desconhecido')}")
 
         regs = data.get("registros", [])
         if not regs:
@@ -2395,7 +2397,7 @@ def ixc_debug_contratos(pagina: int = 1, rp: int = 3):
 
 @app.post("/api/ixc/sync-logins")
 def ixc_sync_logins(meses: int = 14):
-    """Sincroniza cliente_login do IXC usando data_criacao. Requer sync-clientes executado antes."""
+    """Sincroniza radusuarios do IXC usando ultima_atualizacao. Requer sync-clientes executado antes."""
     if not IXC_TOKEN:
         raise HTTPException(status_code=503, detail="IXC_TOKEN não configurado.")
 
@@ -2412,7 +2414,8 @@ def ixc_sync_logins(meses: int = 14):
 
             inseridos = atualizados = 0
             for lg in logins:
-                dc_raw = (lg.get("data_criacao") or "")[:10]
+                # ultima_atualizacao é setado como CURRENT_TIMESTAMP na criação do registro
+                dc_raw = (lg.get("ultima_atualizacao") or "")[:10]
                 if not dc_raw or dc_raw.startswith("0000"):
                     continue
                 try:
@@ -2460,42 +2463,38 @@ def ixc_sync_logins(meses: int = 14):
 
 @app.get("/api/ixc/debug-logins")
 def ixc_debug_logins(pagina: int = 1, rp: int = 3):
-    """Testa candidatos de endpoint para logins IXC e retorna campos/erros de cada um."""
+    """Retorna campos crus de radusuarios — endpoint de logins PPPoE do IXC."""
     if not IXC_TOKEN:
         raise HTTPException(status_code=503, detail="IXC_TOKEN não configurado.")
-
     payload = {
-        "qtype": "id", "query": "1", "oper": ">=",
+        "qtype": "radusuarios.id", "query": "1", "oper": ">=",
         "page": pagina, "rp": rp,
-        "sortname": "id", "sortorder": "desc",
+        "sortname": "radusuarios.id", "sortorder": "desc",
     }
-    candidatos = ["cliente_login", "cliente_acesso", "acessos", "login"]
-    resultados = {}
+    try:
+        resp = requests.post(
+            f"{IXC_BASE}/radusuarios",
+            data=json.dumps(payload),
+            headers=_ixc_headers(),
+            timeout=30,
+            verify=True,
+        )
+        data = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
-    for ep in candidatos:
-        try:
-            resp = requests.post(
-                f"{IXC_BASE}/{ep}",
-                data=json.dumps(payload),
-                headers=_ixc_headers(),
-                timeout=15,
-                verify=True,
-            )
-            data = resp.json()
-            registros = data.get("registros", [])
-            campos = sorted(set(k for r in registros for k in r.keys()))
-            resultados[ep] = {
-                "http_status": resp.status_code,
-                "ixc_type":    data.get("type", "ok"),
-                "ixc_message": data.get("message", ""),
-                "total":       data.get("total", 0),
-                "campos":      campos,
-                "amostra":     registros[:2],
-            }
-        except Exception as e:
-            resultados[ep] = {"erro": str(e)}
+    registros = data.get("registros", [])
+    todos_campos = set()
+    for r in registros:
+        todos_campos.update(r.keys())
 
-    return resultados
+    return {
+        "total_api":          data.get("total", 0),
+        "ixc_type":           data.get("type", "ok"),
+        "ixc_message":        data.get("message", ""),
+        "campos_disponiveis": sorted(todos_campos),
+        "amostra":            registros,
+    }
 
 
 @app.get("/api/ixc/cancelamentos-ixc")
