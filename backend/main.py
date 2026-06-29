@@ -2560,9 +2560,9 @@ def ixc_cancelamentos_ixc(origem: str = "borda_mata"):
 
 @app.get("/api/ixc/vendas")
 def ixc_vendas(origem: str = "borda_mata"):
-    """Retorna conexões IXC por cidade.
-    Fonte primária: ixc_logins (um login = um ponto, inclusive segundo ponto).
-    Fallback: ixc_contratos para clientes sem logins sincronizados.
+    """Retorna novos contratos + segundos pontos IXC por cidade.
+    - Novos clientes: ixc_contratos com data_ativacao (cliente ativo)
+    - Segundo ponto: ixc_logins cujo data_criacao != data_ativacao do seu contrato
     """
     if origem not in IXC_CIDADES:
         raise HTTPException(status_code=400, detail=f"Origem desconhecida: {origem}")
@@ -2573,56 +2573,48 @@ def ixc_vendas(origem: str = "borda_mata"):
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT
-                    lg.ixc_login_id  AS source_id,
-                    'login'          AS tipo,
-                    lg.id_cliente,
-                    lg.login         AS login_nome,
-                    lg.data_criacao  AS data_ativacao,
-                    NULL             AS status,
-                    cl.nome,
-                    cl.bairro,
-                    cl.fone
-                FROM ixc_logins lg
-                INNER JOIN ixc_clientes cl ON cl.ixc_id = lg.id_cliente
-                WHERE lg.cidade_ixc_id = %s AND cl.ativo = 'S'
-
-                UNION ALL
-
+                -- Novos clientes via contrato (fonte primária)
                 SELECT
                     ct.ixc_contrato_id AS source_id,
                     'contrato'         AS tipo,
                     ct.id_cliente,
-                    NULL               AS login_nome,
                     ct.data_ativacao,
                     ct.status,
                     cl.nome,
                     cl.bairro,
                     cl.fone
                 FROM ixc_contratos ct
-                INNER JOIN ixc_clientes cl ON cl.ixc_id = ct.id_cliente
-                WHERE ct.cidade_ixc_id = %s AND cl.ativo = 'S'
-                  AND NOT EXISTS (
-                      SELECT 1 FROM ixc_logins lg2
-                      WHERE lg2.id_cliente = ct.id_cliente
-                  )
+                LEFT JOIN ixc_clientes cl ON cl.ixc_id = ct.id_cliente
+                WHERE ct.cidade_ixc_id = %s
+
+                UNION ALL
+
+                -- Segundo ponto: login com data diferente da ativação do contrato
+                SELECT
+                    lg.ixc_login_id    AS source_id,
+                    'segundo_ponto'    AS tipo,
+                    lg.id_cliente,
+                    lg.data_criacao    AS data_ativacao,
+                    NULL               AS status,
+                    cl.nome,
+                    cl.bairro,
+                    cl.fone
+                FROM ixc_logins lg
+                LEFT JOIN ixc_clientes cl ON cl.ixc_id = lg.id_cliente
+                INNER JOIN ixc_contratos ct ON ct.ixc_contrato_id = lg.id_contrato
+                WHERE lg.cidade_ixc_id = %s
+                  AND lg.data_criacao != ct.data_ativacao
 
                 ORDER BY data_ativacao DESC
             """, (cidade_id, cidade_id))
             rows = [dict(r) for r in cur.fetchall()]
 
-            # last_sync = mais recente entre as duas tabelas
-            cur.execute(
-                "SELECT MAX(synced_at) AS ts FROM ixc_logins WHERE cidade_ixc_id = %s",
-                (cidade_id,)
-            )
-            ts_logins = (cur.fetchone() or {}).get("ts")
             cur.execute(
                 "SELECT MAX(synced_at) AS ts FROM ixc_contratos WHERE cidade_ixc_id = %s",
                 (cidade_id,)
             )
-            ts_contratos = (cur.fetchone() or {}).get("ts")
-            last_sync = max(filter(None, [ts_logins, ts_contratos]), default=None)
+            last_sync_row = cur.fetchone()
+            last_sync = last_sync_row["ts"] if last_sync_row else None
     finally:
         conn.close()
 
